@@ -5,6 +5,7 @@
 package joeyrpc
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,196 +20,202 @@ import (
 	"github.com/Joey0v0/JoeyRPC/codec"
 )
 
-// Server represents an RPC Server.
+// Server keeps an immutable method catalog for each registered receiver.
+// Its zero value is ready to accept registrations.
 type Server struct {
-	serviceMap sync.Map
+	mu       sync.RWMutex
+	services map[string]*service
 }
 
-// NewServer returns a new Server.
-func NewServer() *Server {
-	return &Server{}
-}
+func NewServer() *Server { return &Server{services: make(map[string]*service)} }
 
-// DefaultServer is the default instance of *Server.
 var DefaultServer = NewServer()
-
-// ServeConn runs the server on a single connection.
-// ServeConn blocks, serving the connection until the client hangs up.
-func (server *Server) ServeConn(conn io.ReadWriteCloser) {
-	defer func() { _ = conn.Close() }()
-	var opt Option
-	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
-		log.Println("rpc server: options error: ", err)
-		return
-	}
-	if opt.MagicNumber != MagicNumber {
-		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
-		return
-	}
-	f := codec.NewCodecFuncMap[opt.CodecType]
-	if f == nil {
-		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
-		return
-	}
-	server.serveCodec(f(conn), &opt)
-}
-
-// invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
-func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
-	sending := new(sync.Mutex) // make sure to send a complete response
-	wg := new(sync.WaitGroup)  // wait until all request are handled
-	for {
-		req, err := server.readRequest(cc)
-		if err != nil {
-			if req == nil {
-				break // it's not possible to recover, so close the connection
-			}
-			req.h.Error = err.Error()
-			server.sendResponse(cc, req.h, invalidRequest, sending)
-			continue
-		}
-		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
+func (s *Server) Register(receiver interface{}) error {
+	catalog := newService(receiver)
+	if catalog.err != nil {
+		return catalog.err
 	}
-	wg.Wait()
-	_ = cc.Close()
-}
-
-// request stores all information of a call
-type request struct {
-	h            *codec.Header // header of request
-	argv, replyv reflect.Value // argv and replyv of request
-	mtype        *methodType
-	svc          *service
-}
-
-func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
-	var h codec.Header
-	if err := cc.ReadHeader(&h); err != nil {
-		if err != io.EOF && err != io.ErrUnexpectedEOF {
-			log.Println("rpc server: read header error:", err)
-		}
-		return nil, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.services[catalog.name]; exists {
+		return errors.New("rpc: service already defined: " + catalog.name)
 	}
-	return &h, nil
-}
-
-func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
-	dot := strings.LastIndex(serviceMethod, ".")
-	if dot < 0 {
-		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
-		return
+	if s.services == nil {
+		s.services = make(map[string]*service)
 	}
-	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-	svci, ok := server.serviceMap.Load(serviceName)
-	if !ok {
-		err = errors.New("rpc server: can't find service " + serviceName)
-		return
-	}
-	svc = svci.(*service)
-	mtype = svc.method[methodName]
-	if mtype == nil {
-		err = errors.New("rpc server: can't find method " + methodName)
-	}
-	return
-}
-
-func (server *Server) readRequest(cc codec.Codec) (*request, error) {
-	h, err := server.readRequestHeader(cc)
-	if err != nil {
-		return nil, err
-	}
-	req := &request{h: h}
-	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
-	if err != nil {
-		return req, err
-	}
-	req.argv = req.mtype.newArgv()
-	req.replyv = req.mtype.newReplyv()
-
-	// make sure that argvi is a pointer, ReadBody need a pointer as parameter
-	argvi := req.argv.Interface()
-	if req.argv.Type().Kind() != reflect.Ptr {
-		argvi = req.argv.Addr().Interface()
-	}
-	if err = cc.ReadBody(argvi); err != nil {
-		log.Println("rpc server: read body err:", err)
-		return req, err
-	}
-	return req, nil
-}
-
-func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
-	sending.Lock()
-	defer sending.Unlock()
-	if err := cc.Write(h, body); err != nil {
-		log.Println("rpc server: write response error:", err)
-	}
-}
-
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
-	defer wg.Done()
-	called := make(chan struct{})
-	sent := make(chan struct{})
-	go func() {
-		err := req.svc.call(req.mtype, req.argv, req.replyv)
-		called <- struct{}{}
-		if err != nil {
-			req.h.Error = err.Error()
-			server.sendResponse(cc, req.h, invalidRequest, sending)
-			sent <- struct{}{}
-			return
-		}
-		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-		sent <- struct{}{}
-	}()
-
-	if timeout == 0 {
-		<-called
-		<-sent
-		return
-	}
-	select {
-	case <-time.After(timeout):
-		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
-		server.sendResponse(cc, req.h, invalidRequest, sending)
-	case <-called:
-		<-sent
-	}
-}
-
-// Accept accepts connections on the listener and serves requests
-// for each incoming connection.
-func (server *Server) Accept(lis net.Listener) {
-	for {
-		conn, err := lis.Accept()
-		if err != nil {
-			log.Println("rpc server: accept error:", err)
-			return
-		}
-		go server.ServeConn(conn)
-	}
-}
-
-// Accept accepts connections on the listener and serves requests
-// for each incoming connection.
-func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
-
-// Register publishes in the server the set of methods of the
-// receiver value that satisfy the following conditions:
-//   - exported method of exported type
-//   - two arguments, both of exported type
-//   - the second argument is a pointer
-//   - one return value, of type error
-func (server *Server) Register(rcvr interface{}) error {
-	s := newService(rcvr)
-	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
-		return errors.New("rpc: service already defined: " + s.name)
-	}
+	s.services[catalog.name] = catalog
 	return nil
 }
 
-// Register publishes the receiver's methods in the DefaultServer.
-func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+func Register(receiver interface{}) error { return DefaultServer.Register(receiver) }
+
+func (s *Server) lookup(name string) (*service, *methodType, error) {
+	separator := strings.LastIndexByte(name, '.')
+	if separator < 0 {
+		return nil, nil, errors.New("rpc server: service/method request ill-formed: " + name)
+	}
+	serviceName, methodName := name[:separator], name[separator+1:]
+	s.mu.RLock()
+	catalog := s.services[serviceName]
+	s.mu.RUnlock()
+	if catalog == nil {
+		return nil, nil, errors.New("rpc server: can't find service " + serviceName)
+	}
+	method := catalog.method[methodName]
+	if method == nil {
+		return nil, nil, errors.New("rpc server: can't find method " + methodName)
+	}
+	return catalog, method, nil
+}
+
+// A streamReader retains bytes read ahead by a protocol adapter.
+type streamReader struct {
+	io.ReadWriteCloser
+	input io.Reader
+}
+
+func (s *streamReader) Read(buffer []byte) (int, error) { return s.input.Read(buffer) }
+
+func (s *Server) ServeConn(conn io.ReadWriteCloser) {
+	defer conn.Close()
+	decoder := json.NewDecoder(conn)
+	var settings Option
+	if err := decoder.Decode(&settings); err != nil {
+		log.Printf("rpc server: options error: %v", err)
+		return
+	}
+	if settings.MagicNumber != MagicNumber {
+		log.Printf("rpc server: invalid magic number %x", settings.MagicNumber)
+		return
+	}
+	factory := codec.NewCodecFuncMap[settings.CodecType]
+	if factory == nil {
+		log.Printf("rpc server: invalid codec type %s", settings.CodecType)
+		return
+	}
+	input := bufio.NewReader(io.MultiReader(decoder.Buffered(), conn))
+	// json.Encoder terminates Option with one newline. All remaining bytes
+	// belong to the codec, including any request received in the same read.
+	if next, err := input.Peek(1); err == nil && next[0] == '\n' {
+		_, _ = input.ReadByte()
+	}
+	stream := &streamReader{ReadWriteCloser: conn, input: input}
+	session := &serverSession{
+		owner: s, codec: factory(stream), timeout: settings.HandleTimeout,
+		responses: make(chan response), writerDone: make(chan struct{}),
+	}
+	session.run()
+}
+
+type response struct {
+	header codec.Header
+	body   interface{}
+}
+type invocation struct {
+	header   codec.Header
+	catalog  *service
+	method   *methodType
+	argument reflect.Value
+	reply    reflect.Value
+}
+
+// One writer owns each response stream; request workers only enqueue results.
+type serverSession struct {
+	owner      *Server
+	codec      codec.Codec
+	timeout    time.Duration
+	responses  chan response
+	writerDone chan struct{}
+	jobs       sync.WaitGroup
+}
+
+func (session *serverSession) publish(header codec.Header, body interface{}, err error) {
+	if err != nil {
+		header.Error = err.Error()
+		body = invalidRequest
+	}
+	select {
+	case session.responses <- response{header, body}:
+	case <-session.writerDone:
+	}
+}
+
+func (session *serverSession) writeResponses() {
+	defer close(session.writerDone)
+	for reply := range session.responses {
+		if err := session.codec.Write(&reply.header, reply.body); err != nil {
+			log.Printf("rpc server: write response error: %v", err)
+			_ = session.codec.Close()
+			return
+		}
+	}
+}
+
+func (session *serverSession) run() {
+	defer session.codec.Close()
+	go session.writeResponses()
+	for {
+		var header codec.Header
+		if err := session.codec.ReadHeader(&header); err != nil {
+			break
+		}
+		catalog, method, err := session.owner.lookup(header.ServiceMethod)
+		if err != nil {
+			// Discard the matching body before reading the next request header.
+			readErr := session.codec.ReadBody(nil)
+			session.publish(header, nil, err)
+			if readErr != nil {
+				break
+			}
+			continue
+		}
+		request := invocation{header: header, catalog: catalog, method: method,
+			argument: method.newArgv(), reply: method.newReplyv()}
+		destination := request.argument
+		if destination.Kind() != reflect.Ptr {
+			destination = destination.Addr()
+		}
+		if err := session.codec.ReadBody(destination.Interface()); err != nil {
+			session.publish(header, nil, err)
+			continue
+		}
+		session.jobs.Add(1)
+		go session.execute(request)
+	}
+	session.jobs.Wait()
+	close(session.responses)
+	<-session.writerDone
+}
+
+func (session *serverSession) execute(request invocation) {
+	defer session.jobs.Done()
+	if session.timeout == 0 {
+		err := request.catalog.call(request.method, request.argument, request.reply)
+		session.publish(request.header, request.reply.Interface(), err)
+		return
+	}
+	result := make(chan error, 1)
+	go func() { result <- request.catalog.call(request.method, request.argument, request.reply) }()
+	timer := time.NewTimer(session.timeout)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		session.publish(request.header, request.reply.Interface(), err)
+	case <-timer.C:
+		session.publish(request.header, nil,
+			fmt.Errorf("rpc server: request handle timeout: expect within %s", session.timeout))
+	}
+}
+
+func (s *Server) Accept(listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.ServeConn(conn)
+	}
+}
+func Accept(listener net.Listener) { DefaultServer.Accept(listener) }

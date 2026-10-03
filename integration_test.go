@@ -113,7 +113,7 @@ func TestHTTPTransportAndDebug(t *testing.T) {
 	if err := client.Call(ctx, "Arithmetic.Sum", SumArgs{5, 6}, &reply); err != nil || reply != 11 {
 		t.Fatalf("HTTP call: reply=%d error=%v", reply, err)
 	}
-	resp, err := http.Get(ts.URL + "/debug/geerpc")
+	resp, err := http.Get(ts.URL + "/debug/joeyrpc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestRegistryDiscoveryRoundRobinAndBroadcast(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("X-Geerpc-Server", address)
+		req.Header.Set("X-Joeyrpc-Server", address)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)

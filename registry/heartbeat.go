@@ -1,38 +1,49 @@
 package registry
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 )
 
-// Heartbeat send a heartbeat message every once in a while
-// it's a helper function for a server to register or send heartbeat
-func Heartbeat(registry, addr string, duration time.Duration) {
-	if duration == 0 {
-		// make sure there is enough time to send heart beat
-		// before it's removed from registry
-		duration = defaultTimeout - time.Duration(1)*time.Minute
+var heartbeatHTTP = &http.Client{}
+
+// Heartbeat registers immediately, then renews at the requested interval.
+// As before, a failed renewal ends this heartbeat loop.
+func Heartbeat(address, endpoint string, interval time.Duration) {
+	if interval == 0 {
+		interval = defaultTimeout - time.Minute
 	}
-	var err error
-	err = sendHeartbeat(registry, addr)
+	if err := sendHeartbeat(address, endpoint); err != nil {
+		log.Printf("rpc server: heart beat err: %v", err)
+		return
+	}
 	go func() {
-		t := time.NewTicker(duration)
-		for err == nil {
-			<-t.C
-			err = sendHeartbeat(registry, addr)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := sendHeartbeat(address, endpoint); err != nil {
+				log.Printf("rpc server: heart beat err: %v", err)
+				return
+			}
 		}
 	}()
 }
 
-func sendHeartbeat(registry, addr string) error {
-	log.Println(addr, "send heart beat to registry", registry)
-	httpClient := &http.Client{}
-	req, _ := http.NewRequest("POST", registry, nil)
-	req.Header.Set("X-Geerpc-Server", addr)
-	if _, err := httpClient.Do(req); err != nil {
-		log.Println("rpc server: heart beat err:", err)
+func sendHeartbeat(address, endpoint string) error {
+	request, err := http.NewRequest(http.MethodPost, address, nil)
+	if err != nil {
 		return err
+	}
+	request.Header.Set("X-Joeyrpc-Server", endpoint)
+	response, err := heartbeatHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("rpc registry: unexpected HTTP status %s", response.Status)
 	}
 	return nil
 }

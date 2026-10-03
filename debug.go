@@ -5,56 +5,48 @@
 package joeyrpc
 
 import (
-	"fmt"
 	"html/template"
 	"net/http"
+	"sort"
 )
 
-const debugText = `<html>
-	<body>
-	<title>JoeyRPC Services</title>
-	{{range .}}
-	<hr>
-	Service {{.Name}}
-	<hr>
-		<table>
-		<th align=center>Method</th><th align=center>Calls</th>
-		{{range $name, $mtype := .Method}}
-			<tr>
-			<td align=left font=fixed>{{$name}}({{$mtype.ArgType}}, {{$mtype.ReplyType}}) error</td>
-			<td align=center>{{$mtype.NumCalls}}</td>
-			</tr>
-		{{end}}
-		</table>
-	{{end}}
-	</body>
-	</html>`
+var servicePage = template.Must(template.New("services").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>JoeyRPC Services</title></head>
+<body><h1>JoeyRPC Services</h1>
+{{range .}}<section><h2>Service {{.Name}}</h2>
+<table><thead><tr><th>Method</th><th>Calls</th></tr></thead><tbody>
+{{range .Methods}}<tr><td>{{.Name}}({{.Argument}}, {{.Reply}}) error</td><td>{{.Calls}}</td></tr>{{end}}
+</tbody></table></section>{{end}}</body></html>`))
 
-var debug = template.Must(template.New("RPC debug").Parse(debugText))
-
-type debugHTTP struct {
-	*Server
+type debugHTTP struct{ *Server }
+type methodView struct {
+	Name, Argument, Reply string
+	Calls                 uint64
+}
+type serviceView struct {
+	Name    string
+	Methods []methodView
 }
 
-type debugService struct {
-	Name   string
-	Method map[string]*methodType
-}
-
-// Runs at /debug/geerpc
-func (server debugHTTP) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Build a sorted version of the data.
-	var services []debugService
-	server.serviceMap.Range(func(namei, svci interface{}) bool {
-		svc := svci.(*service)
-		services = append(services, debugService{
-			Name:   namei.(string),
-			Method: svc.method,
-		})
-		return true
-	})
-	err := debug.Execute(w, services)
-	if err != nil {
-		_, _ = fmt.Fprintln(w, "rpc: error executing template:", err.Error())
+// Build an ordered value snapshot before rendering. Templates never traverse
+// the live catalog or invoke methods on internal mutable counters.
+func (s debugHTTP) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	s.mu.RLock()
+	views := make([]serviceView, 0, len(s.services))
+	for name, catalog := range s.services {
+		view := serviceView{Name: name}
+		for methodName, method := range catalog.method {
+			view.Methods = append(view.Methods, methodView{
+				Name: methodName, Argument: method.ArgType.String(), Reply: method.ReplyType.String(), Calls: method.NumCalls(),
+			})
+		}
+		sort.Slice(view.Methods, func(i, j int) bool { return view.Methods[i].Name < view.Methods[j].Name })
+		views = append(views, view)
+	}
+	s.mu.RUnlock()
+	sort.Slice(views, func(i, j int) bool { return views[i].Name < views[j].Name })
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := servicePage.Execute(w, views); err != nil {
+		return
 	}
 }

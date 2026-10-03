@@ -3,6 +3,7 @@ package discovery
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,11 +43,102 @@ func TestStaticSelection(t *testing.T) {
 	}
 }
 
+func TestConcurrentRefreshSharesOneRequest(t *testing.T) {
+	var requests int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		once.Do(func() { close(entered) })
+		<-release
+		w.Header().Set("X-Joeyrpc-Servers", "tcp@one")
+	}))
+	defer ts.Close()
+	d := NewRegistryDiscovery(ts.URL, time.Minute)
+	results := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() { _, err := d.GetAll(); results <- err }()
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("refresh did not reach registry")
+	}
+	close(release)
+	for i := 0; i < 8; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("concurrent refresh issued %d requests", got)
+	}
+}
+
+func TestExplicitUpdateWinsDuringRefresh(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("X-Joeyrpc-Servers", "tcp@stale")
+	}))
+	defer ts.Close()
+	defer unblock()
+	d := NewRegistryDiscovery(ts.URL, time.Minute)
+	refreshed := make(chan error, 1)
+	go func() { refreshed <- d.Refresh() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh did not start")
+	}
+	updated := make(chan error, 1)
+	go func() { updated <- d.Update([]string{"tcp@manual"}) }()
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("network refresh blocked an explicit update")
+	}
+	unblock()
+	if err := <-refreshed; err != nil {
+		t.Fatal(err)
+	}
+	servers, err := d.GetAll()
+	if err != nil || len(servers) != 1 || servers[0] != "tcp@manual" {
+		t.Fatalf("update was overwritten: %v %v", servers, err)
+	}
+}
+
+func TestUpdateOwnsItsAddressSnapshot(t *testing.T) {
+	servers := []string{"tcp@one"}
+	d := NewMultiServerDiscovery(servers)
+	servers[0] = "tcp@changed"
+	address, err := d.Get(RandomSelect)
+	if err != nil || address != "tcp@one" {
+		t.Fatalf("constructor retained caller's slice: %s %v", address, err)
+	}
+	servers[0] = "tcp@two"
+	d.Update(servers)
+	servers[0] = "tcp@changed"
+	address, err = d.Get(RoundRobinSelect)
+	if err != nil || address != "tcp@two" {
+		t.Fatalf("update retained caller's slice: %s %v", address, err)
+	}
+}
+
 func TestRegistryRefreshCache(t *testing.T) {
 	var requests int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requests, 1)
-		w.Header().Set("X-Geerpc-Servers", " tcp@one, ,tcp@two ")
+		w.Header().Set("X-Joeyrpc-Servers", " tcp@one, ,tcp@two ")
 	}))
 	defer ts.Close()
 	d := NewRegistryDiscovery(ts.URL, time.Minute)

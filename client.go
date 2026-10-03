@@ -10,210 +10,222 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 
 	"github.com/Joey0v0/JoeyRPC/codec"
 )
 
-// Call represents an active RPC.
+// Call holds the arguments, destination, and completion notification of one request.
 type Call struct {
 	Seq           uint64
-	ServiceMethod string      // format "<service>.<method>"
-	Args          interface{} // arguments to the function
-	Reply         interface{} // reply from the function
-	Error         error       // if error occurs, it will be set
-	Done          chan *Call  // Strobes when call is complete.
+	ServiceMethod string
+	Args          interface{}
+	Reply         interface{}
+	Error         error
+	Done          chan *Call
 }
 
-func (call *Call) done() {
-	call.Done <- call
+func (call *Call) done() { call.Done <- call }
+
+// A pendingCall owns access to the reply until it completes or is abandoned.
+// Cancellation takes the same lock as decoding so a reply cannot be changed
+// after a synchronous Call returns.
+type pendingCall struct {
+	mu      sync.Mutex
+	call    *Call
+	settled bool
 }
 
-// Client represents an RPC Client.
-// There may be multiple outstanding Calls associated
-// with a single Client, and a Client may be used by
-// multiple goroutines simultaneously.
+func (p *pendingCall) fail(err error) {
+	p.mu.Lock()
+	if p.settled {
+		p.mu.Unlock()
+		return
+	}
+	p.settled = true
+	p.call.Error = err
+	p.mu.Unlock()
+	p.call.done()
+}
+
+func (p *pendingCall) abandon() {
+	p.mu.Lock()
+	p.settled = true
+	p.mu.Unlock()
+}
+
+func (p *pendingCall) decode(cc codec.Codec, header codec.Header) error {
+	p.mu.Lock()
+	if p.settled {
+		p.mu.Unlock()
+		return cc.ReadBody(nil)
+	}
+	var readErr error
+	if header.Error != "" {
+		p.call.Error = errors.New(header.Error)
+		readErr = cc.ReadBody(nil)
+	} else {
+		readErr = cc.ReadBody(p.call.Reply)
+		if readErr != nil {
+			p.call.Error = fmt.Errorf("reading body %w", readErr)
+		}
+	}
+	p.settled = true
+	p.mu.Unlock()
+	p.call.done()
+	return readErr
+}
+
+type clientState uint8
+
+const (
+	clientReady clientState = iota
+	clientClosed
+	clientDisconnected
+)
+
+// Client multiplexes requests on one connection. Writes are serialized;
+// outstanding calls and connection lifecycle are protected separately.
 type Client struct {
-	cc       codec.Codec
-	opt      *Option
-	sending  sync.Mutex // protect following
-	header   codec.Header
-	mu       sync.Mutex // protect following
-	seq      uint64
-	pending  map[uint64]*Call
-	closing  bool // user has called Close
-	shutdown bool // server has told us to stop
+	cc      codec.Codec
+	writeMu sync.Mutex
+	stateMu sync.Mutex
+	state   clientState
+	nextSeq uint64
+	pending map[uint64]*pendingCall
 }
 
 var _ io.Closer = (*Client)(nil)
-
 var ErrShutdown = errors.New("connection is shut down")
 
-// Close the connection
-func (client *Client) Close() error {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	if client.closing {
+func (c *Client) IsAvailable() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.state == clientReady
+}
+
+func (c *Client) Close() error {
+	c.stateMu.Lock()
+	if c.state == clientClosed {
+		c.stateMu.Unlock()
 		return ErrShutdown
 	}
-	client.closing = true
-	return client.cc.Close()
+	c.state = clientClosed
+	c.stateMu.Unlock()
+	err := c.cc.Close()
+	c.disconnect(ErrShutdown)
+	return err
 }
 
-// IsAvailable return true if the client does work
-func (client *Client) IsAvailable() bool {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	return !client.shutdown && !client.closing
+func (c *Client) detach(seq uint64) *pendingCall {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	p := c.pending[seq]
+	delete(c.pending, seq)
+	return p
 }
 
-func (client *Client) registerCall(call *Call) (uint64, error) {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	if client.closing || client.shutdown {
-		return 0, ErrShutdown
+func (c *Client) disconnect(err error) {
+	c.stateMu.Lock()
+	if c.state == clientReady {
+		c.state = clientDisconnected
 	}
-	call.Seq = client.seq
-	client.pending[call.Seq] = call
-	client.seq++
-	return call.Seq, nil
-}
-
-func (client *Client) removeCall(seq uint64) *Call {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	call := client.pending[seq]
-	delete(client.pending, seq)
-	return call
-}
-
-func (client *Client) terminateCalls(err error) {
-	client.sending.Lock()
-	defer client.sending.Unlock()
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	client.shutdown = true
-	for _, call := range client.pending {
-		call.Error = err
-		call.done()
+	abandoned := c.pending
+	c.pending = make(map[uint64]*pendingCall)
+	c.stateMu.Unlock()
+	for _, p := range abandoned {
+		p.fail(err)
 	}
 }
 
-func (client *Client) send(call *Call) {
-	// make sure that the client will send a complete request
-	client.sending.Lock()
-	defer client.sending.Unlock()
-
-	// register this call.
-	seq, err := client.registerCall(call)
-	if err != nil {
-		call.Error = err
-		call.done()
-		return
-	}
-
-	// prepare request header
-	client.header.ServiceMethod = call.ServiceMethod
-	client.header.Seq = seq
-	client.header.Error = ""
-
-	// encode and send the request
-	if err := client.cc.Write(&client.header, call.Args); err != nil {
-		call := client.removeCall(seq)
-		// call may be nil, it usually means that Write partially failed,
-		// client has received the response and handled
-		if call != nil {
-			call.Error = err
-			call.done()
-		}
-	}
-}
-
-func (client *Client) receive() {
-	var err error
-	for err == nil {
-		var h codec.Header
-		if err = client.cc.ReadHeader(&h); err != nil {
-			break
-		}
-		call := client.removeCall(h.Seq)
-		switch {
-		case call == nil:
-			// it usually means that Write partially failed
-			// and call was already removed.
-			err = client.cc.ReadBody(nil)
-		case h.Error != "":
-			call.Error = fmt.Errorf(h.Error)
-			err = client.cc.ReadBody(nil)
-			call.done()
-		default:
-			err = client.cc.ReadBody(call.Reply)
-			if err != nil {
-				call.Error = errors.New("reading body " + err.Error())
-			}
-			call.done()
-		}
-	}
-	// error occurs, so terminateCalls pending calls
-	client.terminateCalls(err)
-}
-
-// Go invokes the function asynchronously.
-// It returns the Call structure representing the invocation.
-func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
+func (c *Client) submit(method string, args, reply interface{}, done chan *Call) *pendingCall {
 	if done == nil {
 		done = make(chan *Call, 10)
-	} else if cap(done) == 0 {
-		log.Panic("rpc client: done channel is unbuffered")
 	}
-	call := &Call{
-		ServiceMethod: serviceMethod,
-		Args:          args,
-		Reply:         reply,
-		Done:          done,
+	if cap(done) == 0 {
+		panic("rpc client: done channel is unbuffered")
 	}
-	client.send(call)
-	return call
+	p := &pendingCall{call: &Call{ServiceMethod: method, Args: args, Reply: reply, Done: done}}
+	c.writeMu.Lock()
+	c.stateMu.Lock()
+	if c.state != clientReady {
+		c.stateMu.Unlock()
+		c.writeMu.Unlock()
+		p.fail(ErrShutdown)
+		return p
+	}
+	p.call.Seq = c.nextSeq
+	c.nextSeq++
+	c.pending[p.call.Seq] = p
+	c.stateMu.Unlock()
+	header := codec.Header{ServiceMethod: method, Seq: p.call.Seq}
+	err := c.cc.Write(&header, args)
+	c.writeMu.Unlock()
+	if err != nil {
+		if failed := c.detach(p.call.Seq); failed != nil {
+			failed.fail(err)
+		}
+	}
+	return p
 }
 
-// Call invokes the named function, waits for it to complete,
-// and returns its error status.
-func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+func (c *Client) readResponses() {
+	for {
+		var header codec.Header
+		err := c.cc.ReadHeader(&header)
+		if err == nil {
+			if p := c.detach(header.Seq); p != nil {
+				err = p.decode(c.cc, header)
+			} else {
+				err = c.cc.ReadBody(nil)
+			}
+		}
+		if err != nil {
+			_ = c.cc.Close()
+			c.disconnect(err)
+			return
+		}
+	}
+}
+
+// Go submits a request and returns without waiting for its response.
+func (c *Client) Go(method string, args, reply interface{}, done chan *Call) *Call {
+	return c.submit(method, args, reply, done).call
+}
+
+// Call waits for the response or cancellation. Cancellation is local to this client.
+func (c *Client) Call(ctx context.Context, method string, args, reply interface{}) error {
+	p := c.submit(method, args, reply, make(chan *Call, 1))
 	select {
+	case completed := <-p.call.Done:
+		return completed.Error
 	case <-ctx.Done():
-		client.removeCall(call.Seq)
-		return errors.New("rpc client: call failed: " + ctx.Err().Error())
-	case call := <-call.Done:
-		return call.Error
+		c.detach(p.call.Seq)
+		p.abandon()
+		return fmt.Errorf("rpc client: call failed: %w", ctx.Err())
 	}
 }
 
+// NewClient sends the JSON connection options before starting the response reader.
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
-	f := codec.NewCodecFuncMap[opt.CodecType]
-	if f == nil {
-		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
-		log.Println("rpc client: codec error:", err)
-		return nil, err
+	if opt == nil {
+		opt = DefaultOption
 	}
-	// send options with server
-	if err := json.NewEncoder(conn).Encode(opt); err != nil {
-		log.Println("rpc client: options error: ", err)
+	settings := *opt
+	factory := codec.NewCodecFuncMap[settings.CodecType]
+	if factory == nil {
+		return nil, fmt.Errorf("invalid codec type %s", settings.CodecType)
+	}
+	if err := json.NewEncoder(conn).Encode(&settings); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-	return newClientCodec(f(conn), opt), nil
+	return newClientCodec(factory(conn), &settings), nil
 }
 
 func newClientCodec(cc codec.Codec, opt *Option) *Client {
-	client := &Client{
-		seq:     1, // seq starts with 1, 0 means invalid call
-		cc:      cc,
-		opt:     opt,
-		pending: make(map[uint64]*Call),
-	}
-	go client.receive()
-	return client
+	c := &Client{cc: cc, nextSeq: 1, pending: make(map[uint64]*pendingCall)}
+	go c.readResponses()
+	return c
 }

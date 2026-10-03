@@ -36,6 +36,8 @@ go run ./examples/registry
 
 示例在一个进程中启动 HTTP 注册中心（端口 9999）和两个 RPC 服务实例，演示随机选择实例、并发求和、广播调用和超时返回。`Foo.Sleep` 的部分调用预期会输出超时错误。
 
+HTTP 协议名称现已统一为 JoeyRPC：RPC 路径为 `/_joeyrpc_`，调试页为 `/debug/joeyrpc`，默认注册中心路径为 `/_joeyrpc_/registry`。旧版 HTTP 客户端和注册发现组件需同步升级，手动配置的 URL 也需更新；直接 TCP 调用的 JSON/Gob 消息格式保持不变。
+
 ## 目录结构
 
 ```text
@@ -57,6 +59,8 @@ go run ./examples/registry
 ```
 
 核心库留在根包，避免调用方导入多层路径；按功能划分独立子包。测试与对应代码放在一起，根目录的 `integration_test.go` 验证包之间的协作。
+
+模块内部设计、兼容范围及逐目录改动见[架构文档](docs/architecture.md)和[实现重写记录](docs/rewrite.md)。
 
 ## 使用方式
 
@@ -120,4 +124,4 @@ defer xc.Close()
 
 ## 许可
 
-第三方代码的来源见 [NOTICE.md](NOTICE.md)，对应版权和许可文本见 [LICENSE](LICENSE)。
+第三方代码的版权说明见 [NOTICE.md](NOTICE.md)，完整许可文本见 [LICENSE](LICENSE)。

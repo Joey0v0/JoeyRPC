@@ -1,7 +1,9 @@
+// Package xclient combines endpoint discovery with reusable RPC connections.
 package xclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"reflect"
 	"sync"
@@ -10,103 +12,158 @@ import (
 	"github.com/Joey0v0/JoeyRPC/discovery"
 )
 
+type connectionSlot struct {
+	ready  chan struct{}
+	client *joeyrpc.Client
+	err    error
+}
+
+// XClient coordinates each endpoint separately so dialing a slow endpoint
+// does not hold the cache lock or delay calls to other endpoints.
 type XClient struct {
-	d       discovery.Discovery
-	mode    discovery.SelectMode
-	opt     *joeyrpc.Option
-	mu      sync.Mutex // protect following
-	clients map[string]*joeyrpc.Client
+	d           discovery.Discovery
+	mode        discovery.SelectMode
+	opt         *joeyrpc.Option
+	mu          sync.Mutex
+	connections map[string]*connectionSlot
+	generation  uint64
 }
 
 var _ io.Closer = (*XClient)(nil)
 
 func NewXClient(d discovery.Discovery, mode discovery.SelectMode, opt *joeyrpc.Option) *XClient {
-	return &XClient{d: d, mode: mode, opt: opt, clients: make(map[string]*joeyrpc.Client)}
+	return &XClient{d: d, mode: mode, opt: opt, connections: make(map[string]*connectionSlot)}
 }
 
-func (xc *XClient) Close() error {
-	xc.mu.Lock()
-	defer xc.mu.Unlock()
-	for key, client := range xc.clients {
-		// Close every cached connection, even if one is already closed.
-		_ = client.Close()
-		delete(xc.clients, key)
+func (x *XClient) Close() error {
+	x.mu.Lock()
+	previous := x.connections
+	x.connections = make(map[string]*connectionSlot)
+	x.generation++
+	x.mu.Unlock()
+	for _, slot := range previous {
+		select {
+		case <-slot.ready:
+			if slot.client != nil {
+				_ = slot.client.Close()
+			}
+		default:
+			// The in-flight constructor checks the generation and closes its
+			// late connection itself.
+		}
 	}
 	return nil
 }
 
-func (xc *XClient) dial(rpcAddr string) (*joeyrpc.Client, error) {
-	xc.mu.Lock()
-	defer xc.mu.Unlock()
-	client, ok := xc.clients[rpcAddr]
-	if ok && !client.IsAvailable() {
-		_ = client.Close()
-		delete(xc.clients, rpcAddr)
-		client = nil
-	}
-	if client == nil {
-		var err error
-		client, err = joeyrpc.XDial(rpcAddr, xc.opt)
-		if err != nil {
-			return nil, err
+func (x *XClient) dial(address string) (*joeyrpc.Client, error) {
+	for {
+		x.mu.Lock()
+		if slot := x.connections[address]; slot != nil {
+			select {
+			case <-slot.ready:
+				if slot.client != nil && slot.client.IsAvailable() {
+					client := slot.client
+					x.mu.Unlock()
+					return client, nil
+				}
+				delete(x.connections, address)
+				x.mu.Unlock()
+				if slot.client != nil {
+					_ = slot.client.Close()
+				}
+				continue
+			default:
+				x.mu.Unlock()
+				<-slot.ready
+				return slot.client, slot.err
+			}
 		}
-		xc.clients[rpcAddr] = client
+		slot := &connectionSlot{ready: make(chan struct{})}
+		generation := x.generation
+		x.connections[address] = slot
+		x.mu.Unlock()
+		client, err := joeyrpc.XDial(address, x.opt)
+		x.mu.Lock()
+		if generation != x.generation {
+			err = joeyrpc.ErrShutdown
+			if client != nil {
+				_ = client.Close()
+				client = nil
+			}
+		}
+		slot.client, slot.err = client, err
+		if err != nil && x.connections[address] == slot {
+			delete(x.connections, address)
+		}
+		close(slot.ready)
+		x.mu.Unlock()
+		return client, err
 	}
-	return client, nil
 }
 
-func (xc *XClient) call(rpcAddr string, ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	client, err := xc.dial(rpcAddr)
+func (x *XClient) call(address string, ctx context.Context, method string, args, reply interface{}) error {
+	client, err := x.dial(address)
 	if err != nil {
 		return err
 	}
-	return client.Call(ctx, serviceMethod, args, reply)
+	return client.Call(ctx, method, args, reply)
 }
 
-// Call invokes the named function, waits for it to complete,
-// and returns its error status.
-// xc will choose a proper server.
-func (xc *XClient) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	rpcAddr, err := xc.d.Get(xc.mode)
+func (x *XClient) Call(ctx context.Context, method string, args, reply interface{}) error {
+	address, err := x.d.Get(x.mode)
 	if err != nil {
 		return err
 	}
-	return xc.call(rpcAddr, ctx, serviceMethod, args, reply)
+	return x.call(address, ctx, method, args, reply)
 }
 
-// Broadcast invokes the named function for every server registered in discovery
-func (xc *XClient) Broadcast(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	servers, err := xc.d.GetAll()
+type broadcastResult struct {
+	reply reflect.Value
+	err   error
+}
+
+// Broadcast collects one result per endpoint. Only the collector writes to the
+// caller's reply; it keeps the first success and returns the first failure.
+func (x *XClient) Broadcast(ctx context.Context, method string, args, reply interface{}) error {
+	addresses, err := x.d.GetAll()
 	if err != nil {
 		return err
 	}
-	var wg sync.WaitGroup
-	var mu sync.Mutex // protect e and replyDone
-	var e error
-	replyDone := reply == nil // if reply is nil, don't need to set value
+	var destination reflect.Value
+	if reply != nil {
+		pointer := reflect.ValueOf(reply)
+		if pointer.Kind() != reflect.Ptr || pointer.IsNil() {
+			return fmt.Errorf("rpc client: reply must be a non-nil pointer")
+		}
+		destination = pointer.Elem()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	for _, rpcAddr := range servers {
-		wg.Add(1)
-		go func(rpcAddr string) {
-			defer wg.Done()
-			var clonedReply interface{}
-			if reply != nil {
-				clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
+	results := make(chan broadcastResult, len(addresses))
+	for _, address := range addresses {
+		go func(endpoint string) {
+			var clone reflect.Value
+			var target interface{}
+			if destination.IsValid() {
+				clone = reflect.New(destination.Type())
+				target = clone.Interface()
 			}
-			err := xc.call(rpcAddr, ctx, serviceMethod, args, clonedReply)
-			mu.Lock()
-			if err != nil && e == nil {
-				e = err
-				cancel() // if any call failed, cancel unfinished calls
-			}
-			if err == nil && !replyDone {
-				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
-				replyDone = true
-			}
-			mu.Unlock()
-		}(rpcAddr)
+			err := x.call(endpoint, ctx, method, args, target)
+			results <- broadcastResult{reply: clone, err: err}
+		}(address)
 	}
-	wg.Wait()
-	return e
+	var firstError error
+	delivered := false
+	for range addresses {
+		result := <-results
+		if result.err != nil && firstError == nil {
+			firstError = result.err
+			cancel()
+		}
+		if result.err == nil && destination.IsValid() && !delivered {
+			destination.Set(result.reply.Elem())
+			delivered = true
+		}
+	}
+	return firstError
 }

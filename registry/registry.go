@@ -1,7 +1,7 @@
+// Package registry implements the JoeyRPC HTTP endpoint registration protocol.
 package registry
 
 import (
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -9,86 +9,71 @@ import (
 	"time"
 )
 
-// Registry is a simple register center, provide following functions.
-// add a server and receive heartbeat to keep it alive.
-// returns all alive servers and delete dead servers sync simultaneously.
-type Registry struct {
-	timeout time.Duration
-	mu      sync.Mutex // protect following
-	servers map[string]*ServerItem
-}
+const (
+	defaultPath    = "/_joeyrpc_/registry"
+	defaultTimeout = 5 * time.Minute
+)
 
+// ServerItem records one endpoint and its most recent renewal.
 type ServerItem struct {
 	Addr  string
 	start time.Time
 }
+type Registry struct {
+	mu      sync.Mutex
+	timeout time.Duration
+	servers map[string]*ServerItem
+}
 
-const (
-	defaultPath    = "/_geerpc_/registry"
-	defaultTimeout = time.Minute * 5
-)
-
-// New create a registry instance with timeout setting
 func New(timeout time.Duration) *Registry {
-	return &Registry{
-		servers: make(map[string]*ServerItem),
-		timeout: timeout,
-	}
+	return &Registry{timeout: timeout, servers: make(map[string]*ServerItem)}
 }
 
 var DefaultRegistry = New(defaultTimeout)
 
-func (r *Registry) putServer(addr string) {
+func (r *Registry) putServer(address string) {
+	renewed := &ServerItem{Addr: address, start: time.Now()}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	s := r.servers[addr]
-	if s == nil {
-		r.servers[addr] = &ServerItem{Addr: addr, start: time.Now()}
-	} else {
-		s.start = time.Now() // if exists, update start time to keep alive
+	if r.servers == nil {
+		r.servers = make(map[string]*ServerItem)
 	}
+	r.servers[address] = renewed
+	r.mu.Unlock()
 }
 
 func (r *Registry) aliveServers() []string {
+	now := time.Now()
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	var alive []string
-	for addr, s := range r.servers {
-		if r.timeout == 0 || s.start.Add(r.timeout).After(time.Now()) {
-			alive = append(alive, addr)
+	addresses := make([]string, 0, len(r.servers))
+	for address, lease := range r.servers {
+		expired := r.timeout != 0 && !lease.start.Add(r.timeout).After(now)
+		if expired {
+			delete(r.servers, address)
 		} else {
-			delete(r.servers, addr)
+			addresses = append(addresses, address)
 		}
 	}
-	sort.Strings(alive)
-	return alive
+	r.mu.Unlock()
+	sort.Strings(addresses)
+	return addresses
 }
 
-// Runs at /_geerpc_/registry
-func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	switch req.Method {
-	case "GET":
-		// keep it simple, server is in req.Header
-		w.Header().Set("X-Geerpc-Servers", strings.Join(r.aliveServers(), ","))
-	case "POST":
-		// keep it simple, server is in req.Header
-		addr := req.Header.Get("X-Geerpc-Server")
-		if addr == "" {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		r.putServer(addr)
-	default:
+func (r *Registry) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	if request.Method == http.MethodGet {
+		w.Header().Set("X-Joeyrpc-Servers", strings.Join(r.aliveServers(), ","))
+		return
+	}
+	if request.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
+	address := request.Header.Get("X-Joeyrpc-Server")
+	if address == "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	r.putServer(address)
 }
 
-// HandleHTTP registers an HTTP handler for Registry messages on registryPath
-func (r *Registry) HandleHTTP(registryPath string) {
-	http.Handle(registryPath, r)
-	log.Println("rpc registry path:", registryPath)
-}
-
-func HandleHTTP() {
-	DefaultRegistry.HandleHTTP(defaultPath)
-}
+func (r *Registry) HandleHTTP(path string) { http.Handle(path, r) }
+func HandleHTTP()                          { DefaultRegistry.HandleHTTP(defaultPath) }

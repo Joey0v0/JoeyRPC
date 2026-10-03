@@ -11,33 +11,36 @@ import (
 	"github.com/Joey0v0/JoeyRPC/codec"
 )
 
+// MagicNumber and Option fields are part of the existing wire protocol.
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber    int           // MagicNumber identifies the RPC wire protocol
-	CodecType      codec.Type    // client may choose different Codec to encode body
-	ConnectTimeout time.Duration // 0 means no limit
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
 	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
 	MagicNumber:    MagicNumber,
 	CodecType:      codec.GobType,
-	ConnectTimeout: time.Second * 10,
+	ConnectTimeout: 10 * time.Second,
 }
 
+// Each connection gets a value snapshot; normalizing one client's options must
+// not mutate a shared Option while another goroutine is dialing.
 func parseOptions(opts ...*Option) (*Option, error) {
-	// if opts is nil or pass nil as parameter
+	settings := *DefaultOption
 	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
+		return &settings, nil
 	}
 	if len(opts) != 1 {
 		return nil, errors.New("number of options is more than 1")
 	}
-	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
-	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
+	settings = *opts[0]
+	settings.MagicNumber = DefaultOption.MagicNumber
+	if settings.CodecType == "" {
+		settings.CodecType = DefaultOption.CodecType
 	}
-	return opt, nil
+	return &settings, nil
 }
