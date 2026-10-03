@@ -1,0 +1,13 @@
+# Go build and test artifacts
+/.gocache/
+/bin/
+/coverage.out
+*.test
+*.exe
+*.prof
+
+# Local editor and OS files
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
