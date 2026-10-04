@@ -6,6 +6,7 @@ package joeyrpc
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,11 +24,19 @@ import (
 // Server keeps an immutable method catalog for each registered receiver.
 // Its zero value is ready to accept registrations.
 type Server struct {
-	mu       sync.RWMutex
-	services map[string]*service
+	mu           sync.RWMutex
+	services     map[string]*service
+	interceptors []ServerInterceptor
+	lifecycle    serverLifecycle
 }
 
 func NewServer() *Server { return &Server{services: make(map[string]*service)} }
+
+func NewServerWithOptions(options ServerOptions) *Server {
+	s := NewServer()
+	s.interceptors = append([]ServerInterceptor(nil), options.Interceptors...)
+	return s
+}
 
 var DefaultServer = NewServer()
 var invalidRequest = struct{}{}
@@ -80,6 +89,11 @@ func (s *streamReader) Read(buffer []byte) (int, error) { return s.input.Read(bu
 
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer conn.Close()
+	tracked := s.trackConnection(conn)
+	if tracked == nil {
+		return
+	}
+	defer s.untrackConnection(tracked)
 	decoder := json.NewDecoder(conn)
 	var settings Option
 	if err := decoder.Decode(&settings); err != nil {
@@ -105,6 +119,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	session := &serverSession{
 		owner: s, codec: factory(stream), timeout: settings.HandleTimeout,
 		responses: make(chan response), writerDone: make(chan struct{}),
+		ctx: tracked.ctx, cancel: tracked.cancel,
 	}
 	session.run()
 }
@@ -112,8 +127,10 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 type response struct {
 	header codec.Header
 	body   interface{}
+	finish func()
 }
 type invocation struct {
+	ctx      context.Context
 	header   codec.Header
 	catalog  *service
 	method   *methodType
@@ -129,23 +146,37 @@ type serverSession struct {
 	responses  chan response
 	writerDone chan struct{}
 	jobs       sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func (session *serverSession) publish(header codec.Header, body interface{}, err error) {
+	session.publishWithDone(header, body, err, nil)
+}
+
+func (session *serverSession) publishWithDone(header codec.Header, body interface{}, err error, finish func()) {
+	header.Metadata = nil // Request metadata (including tokens) is not echoed.
 	if err != nil {
 		header.Error = err.Error()
 		body = invalidRequest
 	}
 	select {
-	case session.responses <- response{header, body}:
+	case session.responses <- response{header: header, body: body, finish: finish}:
 	case <-session.writerDone:
+		if finish != nil {
+			finish()
+		}
 	}
 }
 
 func (session *serverSession) writeResponses() {
 	defer close(session.writerDone)
 	for reply := range session.responses {
-		if err := session.codec.Write(&reply.header, reply.body); err != nil {
+		err := session.codec.Write(&reply.header, reply.body)
+		if reply.finish != nil {
+			reply.finish()
+		}
+		if err != nil {
 			log.Printf("rpc server: write response error: %v", err)
 			_ = session.codec.Close()
 			return
@@ -156,6 +187,7 @@ func (session *serverSession) writeResponses() {
 func (session *serverSession) run() {
 	defer session.codec.Close()
 	go session.writeResponses()
+	draining := false
 	for {
 		var header codec.Header
 		if err := session.codec.ReadHeader(&header); err != nil {
@@ -181,8 +213,17 @@ func (session *serverSession) run() {
 			session.publish(header, nil, err)
 			continue
 		}
+		if !session.owner.beginRequest() {
+			draining = true
+			session.publish(header, nil, ErrServerShutdown)
+			break
+		}
+		request.ctx = WithMetadata(session.ctx, Metadata(header.Metadata))
 		session.jobs.Add(1)
 		go session.execute(request)
+	}
+	if !draining {
+		session.cancel()
 	}
 	session.jobs.Wait()
 	close(session.responses)
@@ -191,25 +232,61 @@ func (session *serverSession) run() {
 
 func (session *serverSession) execute(request invocation) {
 	defer session.jobs.Done()
+	ctx, cancel := context.WithCancel(request.ctx)
+	defer cancel()
+	handler := chainServer(session.owner.interceptors, request.header.ServiceMethod,
+		func(ctx context.Context, args, reply interface{}) error {
+			return request.catalog.callContext(ctx, request.method, reflect.ValueOf(args), reflect.ValueOf(reply))
+		})
+	run := func() (err error) {
+		defer session.owner.lifecycle.tasks.Done()
+		defer func() {
+			if failure := recover(); failure != nil {
+				err = fmt.Errorf("rpc server: interceptor panic: %v", failure)
+			}
+		}()
+		return handler(ctx, request.argument.Interface(), request.reply.Interface())
+	}
+	respond := func(body interface{}, err error) {
+		session.publishWithDone(request.header, body, err, session.owner.lifecycle.tasks.Done)
+	}
 	if session.timeout == 0 {
-		err := request.catalog.call(request.method, request.argument, request.reply)
-		session.publish(request.header, request.reply.Interface(), err)
+		err := run()
+		respond(request.reply.Interface(), err)
 		return
 	}
 	result := make(chan error, 1)
-	go func() { result <- request.catalog.call(request.method, request.argument, request.reply) }()
+	go func() { result <- run() }()
 	timer := time.NewTimer(session.timeout)
 	defer timer.Stop()
 	select {
 	case err := <-result:
-		session.publish(request.header, request.reply.Interface(), err)
+		respond(request.reply.Interface(), err)
 	case <-timer.C:
-		session.publish(request.header, nil,
-			fmt.Errorf("rpc server: request handle timeout: expect within %s", session.timeout))
+		cancel()
+		respond(nil, fmt.Errorf("rpc server: request handle timeout: expect within %s", session.timeout))
+	case <-ctx.Done():
+		respond(nil, ctx.Err())
 	}
 }
 
 func (s *Server) Accept(listener net.Listener) {
+	s.lifecycle.mu.Lock()
+	if s.lifecycle.closing {
+		s.lifecycle.mu.Unlock()
+		_ = listener.Close()
+		return
+	}
+	if s.lifecycle.listeners == nil {
+		s.lifecycle.listeners = make(map[net.Listener]struct{})
+	}
+	s.lifecycle.listeners[listener] = struct{}{}
+	s.lifecycle.mu.Unlock()
+	defer func() {
+		s.lifecycle.mu.Lock()
+		delete(s.lifecycle.listeners, listener)
+		s.lifecycle.mu.Unlock()
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

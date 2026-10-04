@@ -27,12 +27,18 @@ type XClient struct {
 	mu          sync.Mutex
 	connections map[string]*connectionSlot
 	generation  uint64
+	options     Options
 }
 
 var _ io.Closer = (*XClient)(nil)
 
 func NewXClient(d discovery.Discovery, mode discovery.SelectMode, opt *joeyrpc.Option) *XClient {
-	return &XClient{d: d, mode: mode, opt: opt, connections: make(map[string]*connectionSlot)}
+	return NewXClientWithOptions(d, mode, opt, Options{})
+}
+
+func NewXClientWithOptions(d discovery.Discovery, mode discovery.SelectMode, opt *joeyrpc.Option, options Options) *XClient {
+	options.Client.Interceptors = append([]joeyrpc.ClientInterceptor(nil), options.Client.Interceptors...)
+	return &XClient{d: d, mode: mode, opt: opt, connections: make(map[string]*connectionSlot), options: options}
 }
 
 func (x *XClient) Close() error {
@@ -56,7 +62,14 @@ func (x *XClient) Close() error {
 }
 
 func (x *XClient) dial(address string) (*joeyrpc.Client, error) {
+	return x.dialContext(context.Background(), address)
+}
+
+func (x *XClient) dialContext(ctx context.Context, address string) (*joeyrpc.Client, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		x.mu.Lock()
 		if slot := x.connections[address]; slot != nil {
 			select {
@@ -74,15 +87,19 @@ func (x *XClient) dial(address string) (*joeyrpc.Client, error) {
 				continue
 			default:
 				x.mu.Unlock()
-				<-slot.ready
-				return slot.client, slot.err
+				select {
+				case <-slot.ready:
+					return slot.client, slot.err
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
 		}
 		slot := &connectionSlot{ready: make(chan struct{})}
 		generation := x.generation
 		x.connections[address] = slot
 		x.mu.Unlock()
-		client, err := joeyrpc.XDial(address, x.opt)
+		client, err := joeyrpc.XDialContext(ctx, address, x.options.Client, x.opt)
 		x.mu.Lock()
 		if generation != x.generation {
 			err = joeyrpc.ErrShutdown
@@ -102,19 +119,15 @@ func (x *XClient) dial(address string) (*joeyrpc.Client, error) {
 }
 
 func (x *XClient) call(address string, ctx context.Context, method string, args, reply interface{}) error {
-	client, err := x.dial(address)
+	client, err := x.dialContext(ctx, address)
 	if err != nil {
-		return err
+		return &dialFailure{err: err}
 	}
 	return client.Call(ctx, method, args, reply)
 }
 
 func (x *XClient) Call(ctx context.Context, method string, args, reply interface{}) error {
-	address, err := x.d.Get(x.mode)
-	if err != nil {
-		return err
-	}
-	return x.call(address, ctx, method, args, reply)
+	return x.callWithRetry(ctx, method, args, reply)
 }
 
 type broadcastResult struct {

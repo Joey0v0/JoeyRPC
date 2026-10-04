@@ -63,12 +63,12 @@ func (p *pendingCall) decode(cc codec.Codec, header codec.Header) error {
 	}
 	var readErr error
 	if header.Error != "" {
-		p.call.Error = errors.New(header.Error)
+		p.call.Error = &RemoteError{Message: header.Error}
 		readErr = cc.ReadBody(nil)
 	} else {
 		readErr = cc.ReadBody(p.call.Reply)
 		if readErr != nil {
-			p.call.Error = fmt.Errorf("reading body %w", readErr)
+			p.call.Error = &TransportError{Err: fmt.Errorf("reading body %w", readErr)}
 		}
 	}
 	p.settled = true
@@ -88,12 +88,13 @@ const (
 // Client multiplexes requests on one connection. Writes are serialized;
 // outstanding calls and connection lifecycle are protected separately.
 type Client struct {
-	cc      codec.Codec
-	writeMu sync.Mutex
-	stateMu sync.Mutex
-	state   clientState
-	nextSeq uint64
-	pending map[uint64]*pendingCall
+	cc           codec.Codec
+	writeMu      sync.Mutex
+	stateMu      sync.Mutex
+	state        clientState
+	nextSeq      uint64
+	pending      map[uint64]*pendingCall
+	interceptors []ClientInterceptor
 }
 
 var _ io.Closer = (*Client)(nil)
@@ -140,6 +141,10 @@ func (c *Client) disconnect(err error) {
 }
 
 func (c *Client) submit(method string, args, reply interface{}, done chan *Call) *pendingCall {
+	return c.submitContext(context.Background(), method, args, reply, done)
+}
+
+func (c *Client) submitContext(ctx context.Context, method string, args, reply interface{}, done chan *Call) *pendingCall {
 	if done == nil {
 		done = make(chan *Call, 10)
 	}
@@ -147,7 +152,16 @@ func (c *Client) submit(method string, args, reply interface{}, done chan *Call)
 		panic("rpc client: done channel is unbuffered")
 	}
 	p := &pendingCall{call: &Call{ServiceMethod: method, Args: args, Reply: reply, Done: done}}
+	if err := ctx.Err(); err != nil {
+		p.fail(err)
+		return p
+	}
 	c.writeMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.writeMu.Unlock()
+		p.fail(err)
+		return p
+	}
 	c.stateMu.Lock()
 	if c.state != clientReady {
 		c.stateMu.Unlock()
@@ -159,12 +173,12 @@ func (c *Client) submit(method string, args, reply interface{}, done chan *Call)
 	c.nextSeq++
 	c.pending[p.call.Seq] = p
 	c.stateMu.Unlock()
-	header := codec.Header{ServiceMethod: method, Seq: p.call.Seq}
+	header := codec.Header{ServiceMethod: method, Seq: p.call.Seq, Metadata: MetadataFromContext(ctx)}
 	err := c.cc.Write(&header, args)
 	c.writeMu.Unlock()
 	if err != nil {
 		if failed := c.detach(p.call.Seq); failed != nil {
-			failed.fail(err)
+			failed.fail(&TransportError{Err: err})
 		}
 	}
 	return p
@@ -183,7 +197,7 @@ func (c *Client) readResponses() {
 		}
 		if err != nil {
 			_ = c.cc.Close()
-			c.disconnect(err)
+			c.disconnect(&TransportError{Err: err})
 			return
 		}
 	}
@@ -196,7 +210,11 @@ func (c *Client) Go(method string, args, reply interface{}, done chan *Call) *Ca
 
 // Call waits for the response or cancellation. Cancellation is local to this client.
 func (c *Client) Call(ctx context.Context, method string, args, reply interface{}) error {
-	p := c.submit(method, args, reply, make(chan *Call, 1))
+	return chainClient(c.interceptors, c.call)(ctx, method, args, reply)
+}
+
+func (c *Client) call(ctx context.Context, method string, args, reply interface{}) error {
+	p := c.submitContext(ctx, method, args, reply, make(chan *Call, 1))
 	select {
 	case completed := <-p.call.Done:
 		return completed.Error

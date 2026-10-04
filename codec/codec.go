@@ -8,6 +8,7 @@ type Header struct {
 	ServiceMethod string
 	Seq           uint64
 	Error         string
+	Metadata      map[string]string
 }
 
 type Codec interface {

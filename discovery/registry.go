@@ -1,10 +1,10 @@
 package discovery
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -14,11 +14,11 @@ const defaultUpdateTimeout = 10 * time.Second
 // An explicit Update wins over a refresh that was already in flight.
 type RegistryDiscovery struct {
 	*MultiServersDiscovery
-	registry   string
-	timeout    time.Duration
-	lastUpdate time.Time
-	revision   uint64
-	refreshMu  sync.Mutex
+	registry    string
+	timeout     time.Duration
+	lastUpdate  time.Time
+	revision    uint64
+	refreshGate chan struct{}
 }
 
 var _ Discovery = (*RegistryDiscovery)(nil)
@@ -27,7 +27,7 @@ func NewRegistryDiscovery(address string, timeout time.Duration) *RegistryDiscov
 	if timeout == 0 {
 		timeout = defaultUpdateTimeout
 	}
-	return &RegistryDiscovery{MultiServersDiscovery: NewMultiServerDiscovery(nil), registry: address, timeout: timeout}
+	return &RegistryDiscovery{MultiServersDiscovery: NewMultiServerDiscovery(nil), registry: address, timeout: timeout, refreshGate: make(chan struct{}, 1)}
 }
 
 func (d *RegistryDiscovery) Update(servers []string) error {
@@ -41,8 +41,19 @@ func (d *RegistryDiscovery) Update(servers []string) error {
 }
 
 func (d *RegistryDiscovery) Refresh() error {
-	d.refreshMu.Lock()
-	defer d.refreshMu.Unlock()
+	return d.RefreshContext(context.Background())
+}
+
+func (d *RegistryDiscovery) RefreshContext(ctx context.Context) error {
+	select {
+	case d.refreshGate <- struct{}{}:
+		defer func() { <-d.refreshGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	d.mu.RLock()
 	fresh := d.lastUpdate.Add(d.timeout).After(time.Now())
 	revision := d.revision
@@ -50,7 +61,11 @@ func (d *RegistryDiscovery) Refresh() error {
 	if fresh {
 		return nil
 	}
-	response, err := http.Get(d.registry)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, d.registry, nil)
+	if err != nil {
+		return err
+	}
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return err
 	}
@@ -75,13 +90,21 @@ func (d *RegistryDiscovery) Refresh() error {
 }
 
 func (d *RegistryDiscovery) Get(mode SelectMode) (string, error) {
-	if err := d.Refresh(); err != nil {
+	return d.GetContext(context.Background(), mode)
+}
+
+func (d *RegistryDiscovery) GetContext(ctx context.Context, mode SelectMode) (string, error) {
+	if err := d.RefreshContext(ctx); err != nil {
 		return "", err
 	}
 	return d.MultiServersDiscovery.Get(mode)
 }
 func (d *RegistryDiscovery) GetAll() ([]string, error) {
-	if err := d.Refresh(); err != nil {
+	return d.GetAllContext(context.Background())
+}
+
+func (d *RegistryDiscovery) GetAllContext(ctx context.Context) ([]string, error) {
+	if err := d.RefreshContext(ctx); err != nil {
 		return nil, err
 	}
 	return d.MultiServersDiscovery.GetAll()

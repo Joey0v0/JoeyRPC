@@ -1,6 +1,7 @@
 package joeyrpc
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync/atomic"
@@ -9,12 +10,14 @@ import (
 )
 
 var errorType = reflect.TypeOf((*error)(nil)).Elem()
+var contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
 
 type methodType struct {
-	numCalls  uint64
-	ArgType   reflect.Type
-	ReplyType reflect.Type
-	invoke    reflect.Value
+	numCalls    uint64
+	ArgType     reflect.Type
+	ReplyType   reflect.Type
+	invoke      reflect.Value
+	withContext bool
 }
 
 func (m *methodType) NumCalls() uint64 { return atomic.LoadUint64(&m.numCalls) }
@@ -76,27 +79,41 @@ func newService(receiver interface{}) *service {
 	for index := 0; index < value.NumMethod(); index++ {
 		bound := value.Method(index)
 		signature := bound.Type()
-		if signature.NumIn() != 2 || signature.NumOut() != 1 || signature.Out(0) != errorType {
+		if signature.NumOut() != 1 || signature.Out(0) != errorType {
 			continue
 		}
-		argument, reply := signature.In(0), signature.In(1)
+		offset := 0
+		if signature.NumIn() == 3 && signature.In(0) == contextType {
+			offset = 1
+		} else if signature.NumIn() != 2 {
+			continue
+		}
+		argument, reply := signature.In(offset), signature.In(offset+1)
 		if reply.Kind() != reflect.Ptr || !isExportedOrBuiltinType(argument) || !isExportedOrBuiltinType(reply) {
 			continue
 		}
 		name := value.Type().Method(index).Name
-		s.method[name] = &methodType{ArgType: argument, ReplyType: reply, invoke: bound}
+		s.method[name] = &methodType{ArgType: argument, ReplyType: reply, invoke: bound, withContext: offset == 1}
 	}
 	return s
 }
 
 func (s *service) call(method *methodType, argument, reply reflect.Value) (err error) {
+	return s.callContext(context.Background(), method, argument, reply)
+}
+
+func (s *service) callContext(ctx context.Context, method *methodType, argument, reply reflect.Value) (err error) {
 	atomic.AddUint64(&method.numCalls, 1)
 	defer func() {
 		if failure := recover(); failure != nil {
 			err = fmt.Errorf("rpc server: method panic: %v", failure)
 		}
 	}()
-	result := method.invoke.Call([]reflect.Value{argument, reply})[0]
+	inputs := []reflect.Value{argument, reply}
+	if method.withContext {
+		inputs = append([]reflect.Value{reflect.ValueOf(ctx)}, inputs...)
+	}
+	result := method.invoke.Call(inputs)[0]
 	if !result.IsNil() {
 		return result.Interface().(error)
 	}

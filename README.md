@@ -1,12 +1,25 @@
 # JoeyRPC
 
-JoeyRPC 是一个使用 Go 标准库实现的轻量级 RPC 学习项目，包含反射服务注册、并发调用、Gob 编解码、超时控制，以及基础的注册中心、服务发现和客户端负载均衡。
+JoeyRPC 是一个使用 Go 标准库实现的轻量级 RPC 框架。在 TCP 持久连接上使用 Gob 编码请求与响应，通过反射注册服务方法，支持并发调用、超时控制和基础的多节点调用。
 
-项目展示名称为 **JoeyRPC**，Go 模块路径为 `github.com/Joey0v0/JoeyRPC`，根包名为 `joeyrpc`。目前没有第三方依赖。
+项目还提供请求 Metadata、同步调用拦截器、可选重试及服务端优雅关闭，适合学习 RPC 协议、请求生命周期和 Go 并发实现。
 
-## 在其他项目中引入
+Go 模块路径为 `github.com/Joey0v0/JoeyRPC`，根包名为 `joeyrpc`，无第三方运行依赖。
 
-代码推送到 GitHub 仓库后，其他项目可执行：
+## 功能
+
+| 能力 | 当前实现 |
+| --- | --- |
+| 通信 | TCP、HTTP CONNECT、Unix Socket；Gob 编解码 |
+| 服务方法 | 反射注册，支持普通方法和带 `context.Context` 的方法 |
+| 并发调用 | Seq 与 pending 表匹配响应，单连接支持多个请求 |
+| 超时和错误 | 建连、调用、服务处理三类超时；区分业务错误与传输错误 |
+| 多节点 | 内存注册中心、心跳、地址发现、随机/轮询选择、连接复用和广播 |
+| 扩展能力 | 请求 Metadata、拦截器链、可选重试、优雅关闭 |
+
+## 安装
+
+在使用方的 Go Modules 项目中执行：
 
 ```sh
 go get github.com/Joey0v0/JoeyRPC@latest
@@ -22,47 +35,62 @@ import (
 )
 ```
 
-在发布版本标签后，也可以指定版本，例如 `go get github.com/Joey0v0/JoeyRPC@v0.1.0`。此命令要求仓库中已存在对应标签。
+## 运行示例
 
-## 快速运行
+### 两个进程之间的 RPC 调用
+
+在仓库根目录打开两个终端。先启动服务端：
+
+```sh
+go run ./examples/basic/server
+```
+
+再启动客户端：
+
+```sh
+go run ./examples/basic/client -a 10 -b 20
+```
+
+客户端输出 `10 + 20 = 30`。两端默认使用 `127.0.0.1:8000`，也可通过 `-addr` 指定地址；服务端按 Ctrl+C 后优雅关闭。
+
+### 注册发现与多节点调用
 
 在项目根目录执行：
 
 ```sh
-go test ./...
-go vet ./...
 go run ./examples/registry
 ```
 
-示例在一个进程中启动 HTTP 注册中心（端口 9999）和两个 RPC 服务实例，演示随机选择实例、并发求和、广播调用和超时返回。`Foo.Sleep` 的部分调用预期会输出超时错误。
+示例在同一进程启动 HTTP 注册中心和两个 RPC 服务实例，演示随机节点选择、连接复用、广播和超时。部分休眠调用预期返回超时错误。
 
-HTTP 协议名称现已统一为 JoeyRPC：RPC 路径为 `/_joeyrpc_`，调试页为 `/debug/joeyrpc`，默认注册中心路径为 `/_joeyrpc_/registry`。旧版 HTTP 客户端和注册发现组件需同步升级，手动配置的 URL 也需更新；直接 TCP 调用的 JSON/Gob 消息格式保持不变。
+### Metadata、拦截器、重试与关闭
 
-## 目录结构
+```sh
+go run ./examples/features
+```
+
+示例使用临时端口，演示 traceID 传递、token 鉴权、调用日志、连接失败后切换节点和 `Shutdown(ctx)`。缺少 token 的调用预期返回鉴权错误。
+
+## 项目结构
 
 ```text
 .
-├── client.go              # 单连接客户端、请求跟踪、同步与异步调用
-├── server.go              # 接收连接、请求分发、并发处理
-├── service.go             # 反射注册、参数创建、方法执行
-├── option.go              # 连接配置、默认值和配置解析
-├── dial.go                # 建连超时和 protocol@address 路由
-├── http.go                # HTTP CONNECT 传输适配
-├── debug.go               # 服务与方法调用次数调试页
-├── doc.go                 # 根包文档
-├── codec/                 # 消息头、编解码接口与 Gob 实现
-├── discovery/             # 静态/注册中心发现，随机与轮询选择
-├── registry/              # HTTP 注册中心与心跳发送
-├── xclient/               # 多实例客户端、连接复用和广播
-├── examples/registry/     # 可直接运行的完整示例
-└── docs/architecture.md   # 架构、协议、调用流程与实现边界
+├── *.go                   # 客户端、服务端、注册和扩展功能
+├── *_test.go              # 核心与集成测试
+├── codec/                 # Gob 编解码与消息头
+├── discovery/             # 地址发现、缓存和节点选择
+├── registry/              # HTTP 注册中心与心跳
+├── xclient/               # 多节点调用、连接复用、重试与广播
+├── examples/
+│   ├── basic/             # 独立服务端和客户端示例
+│   ├── registry/          # 注册发现与广播示例
+│   └── features/          # Metadata、拦截器、重试与关闭示例
+└── docs/                  # 架构、扩展功能和测试说明
 ```
 
-核心库留在根包，避免调用方导入多层路径；按功能划分独立子包。测试与对应代码放在一起，根目录的 `integration_test.go` 验证包之间的协作。
+测试与对应代码放在一起。Go 在普通构建和导入库时不编译 `*_test.go`，保留测试不会增加使用方的运行代码。
 
-模块内部设计、兼容范围及逐目录改动见[架构文档](docs/architecture.md)和[实现重写记录](docs/rewrite.md)。
-
-## 使用方式
+## 核心用法
 
 服务端注册方法：
 
@@ -104,7 +132,9 @@ if err := client.Call(ctx, "Calculator.Sum", Args{A: 1, B: 2}, &reply); err != n
 }
 ```
 
-以上片段需放入应用程序并导入 `github.com/Joey0v0/JoeyRPC` 及所用标准库。多实例调用使用 `discovery` 和 `xclient`：
+以上是函数内的使用片段，完整程序见[服务端](examples/basic/server/main.go)与[客户端](examples/basic/client/main.go)。普通方法的签名为 `Method(args, replyPointer) error`；需要读取 Metadata 的方法可增加首个 `context.Context` 参数。
+
+多实例调用使用 `discovery` 和 `xclient`：
 
 ```go
 import (
@@ -112,16 +142,39 @@ import (
     "github.com/Joey0v0/JoeyRPC/xclient"
 )
 
-// 以下语句放在函数内。
+// 以下语句放在函数内，ctx、Args 等沿用上方示例。
 d := discovery.NewMultiServerDiscovery([]string{
     "tcp@127.0.0.1:8000",
     "tcp@127.0.0.1:8001",
 })
 xc := xclient.NewXClient(d, discovery.RoundRobinSelect, nil)
 defer xc.Close()
-// 使用 xc.Call(ctx, "Calculator.Sum", args, &reply)。
+err = xc.Call(ctx, "Calculator.Sum", Args{A: 10, B: 20}, &reply)
 ```
+
+`XClient` 选择节点并管理底层连接；随机策略使用 `discovery.RandomSelect`。使用注册中心时，将静态发现替换为 `discovery.NewRegistryDiscovery(registryURL, 0)`。
+
+默认没有拦截器，重试默认关闭。完整配置见[扩展功能说明](docs/features.md)。
+
+## 验证
+
+```sh
+go test -count=1 ./...
+go vet ./...
+```
+
+测试覆盖并发调用、错误处理、Metadata、拦截器、重试和关闭。测试范围及平台说明见[测试说明](docs/testing.md)。
+
+## 实现边界
+
+- 当前使用 Gob 编码，通信双方都需要理解 JoeyRPC 协议。仅支持 TCP 的既有系统仍需接入或适配该协议。
+- 注册中心使用内存地址表，没有按服务名分组、持久化或高可用机制。
+- 客户端取消不会传到服务端；业务 goroutine 需要配合 Context 才能在取消后停止。
+- 客户端拦截器与 Metadata 用于同步 `Call`；异步 `Go` 保留基础调用行为。Broadcast 不自动重试。
+- 请求发出后是否可重试，由应用保证方法幂等性。项目尚未完成生产环境下的长期压力与故障验证。
+
+详细的协议和默认参数见[架构说明](docs/architecture.md)。
 
 ## 许可
 
-第三方代码的版权说明见 [NOTICE.md](NOTICE.md)，完整许可文本见 [LICENSE](LICENSE)。
+项目包含第三方代码及其修改。版权与许可说明见 [NOTICE.md](NOTICE.md)，完整许可文本见 [LICENSE](LICENSE)。

@@ -5,6 +5,7 @@
 package joeyrpc
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -18,16 +19,29 @@ type clientResult struct {
 	err    error
 }
 
+type connectTimeoutError struct{ duration time.Duration }
+
+func (e *connectTimeoutError) Error() string {
+	return fmt.Sprintf("rpc client: connect timeout: expect within %s", e.duration)
+}
+func (e *connectTimeoutError) Timeout() bool   { return true }
+func (e *connectTimeoutError) Temporary() bool { return true }
+
 func dialTimeout(build newClientFunc, network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeoutContext(context.Background(), build, network, address, opts...)
+}
+
+func dialTimeoutContext(ctx context.Context, build newClientFunc, network, address string, opts ...*Option) (*Client, error) {
 	settings, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.DialTimeout(network, address, settings.ConnectTimeout)
+	dialer := net.Dialer{Timeout: settings.ConnectTimeout}
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
-	if settings.ConnectTimeout == 0 {
+	if settings.ConnectTimeout == 0 && ctx.Done() == nil {
 		client, err := build(conn, settings)
 		if err != nil {
 			_ = conn.Close()
@@ -52,19 +66,16 @@ func dialTimeout(build newClientFunc, network, address string, opts ...*Option) 
 			ownership.Unlock()
 		}
 	}()
-	timer := time.NewTimer(settings.ConnectTimeout)
-	defer timer.Stop()
-	select {
-	case value := <-result:
-		if value.err != nil {
-			_ = conn.Close()
-		}
-		return value.client, value.err
-	case <-timer.C:
+	var timeout <-chan time.Time
+	if settings.ConnectTimeout != 0 {
+		timer := time.NewTimer(settings.ConnectTimeout)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	abandon := func() {
 		ownership.Lock()
 		expired = true
 		_ = conn.Close()
-		// If construction won just before timeout, dispose of that client too.
 		select {
 		case value := <-result:
 			if value.client != nil {
@@ -73,7 +84,19 @@ func dialTimeout(build newClientFunc, network, address string, opts ...*Option) 
 		default:
 		}
 		ownership.Unlock()
-		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", settings.ConnectTimeout)
+	}
+	select {
+	case value := <-result:
+		if value.err != nil {
+			_ = conn.Close()
+		}
+		return value.client, value.err
+	case <-timeout:
+		abandon()
+		return nil, &connectTimeoutError{duration: settings.ConnectTimeout}
+	case <-ctx.Done():
+		abandon()
+		return nil, ctx.Err()
 	}
 }
 
@@ -81,15 +104,43 @@ func Dial(network, address string, opts ...*Option) (*Client, error) {
 	return dialTimeout(NewClient, network, address, opts...)
 }
 
+// DialWithOptions configures client-side interceptors without changing wire options.
+func DialWithOptions(network, address string, local ClientOptions, opts ...*Option) (*Client, error) {
+	interceptors := append([]ClientInterceptor(nil), local.Interceptors...)
+	build := func(conn net.Conn, opt *Option) (*Client, error) {
+		client, err := NewClient(conn, opt)
+		if client != nil {
+			client.interceptors = interceptors
+		}
+		return client, err
+	}
+	return dialTimeout(build, network, address, opts...)
+}
+
 // XDial accepts the established protocol@address notation.
 func XDial(address string, opts ...*Option) (*Client, error) {
+	return XDialContext(context.Background(), address, ClientOptions{}, opts...)
+}
+
+// XDialContext also cancels network dialing and RPC initialization.
+func XDialContext(ctx context.Context, address string, local ClientOptions, opts ...*Option) (*Client, error) {
 	separator := strings.IndexByte(address, '@')
 	if separator < 0 || strings.Contains(address[separator+1:], "@") {
 		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", address)
 	}
 	network, endpoint := address[:separator], address[separator+1:]
+	constructor := newClientFunc(NewClient)
 	if network == "http" {
-		return DialHTTP("tcp", endpoint, opts...)
+		network = "tcp"
+		constructor = NewHTTPClient
 	}
-	return Dial(network, endpoint, opts...)
+	interceptors := append([]ClientInterceptor(nil), local.Interceptors...)
+	build := func(conn net.Conn, opt *Option) (*Client, error) {
+		client, err := constructor(conn, opt)
+		if client != nil {
+			client.interceptors = interceptors
+		}
+		return client, err
+	}
+	return dialTimeoutContext(ctx, build, network, endpoint, opts...)
 }

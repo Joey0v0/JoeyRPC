@@ -36,8 +36,12 @@ func (s debugHTTP) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	for name, catalog := range s.services {
 		view := serviceView{Name: name}
 		for methodName, method := range catalog.method {
+			argument := method.ArgType.String()
+			if method.withContext {
+				argument = "context.Context, " + argument
+			}
 			view.Methods = append(view.Methods, methodView{
-				Name: methodName, Argument: method.ArgType.String(), Reply: method.ReplyType.String(), Calls: method.NumCalls(),
+				Name: methodName, Argument: argument, Reply: method.ReplyType.String(), Calls: method.NumCalls(),
 			})
 		}
 		sort.Slice(view.Methods, func(i, j int) bool { return view.Methods[i].Name < view.Methods[j].Name })
