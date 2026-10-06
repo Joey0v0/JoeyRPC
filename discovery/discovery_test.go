@@ -3,11 +3,80 @@ package discovery
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestSmoothWeightedRoundRobin(t *testing.T) {
+	d := NewMultiServerDiscovery(nil)
+	if err := d.UpdateWeighted([]Server{{"A", 5}, {"B", 1}, {"C", 1}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"A", "A", "B", "A", "C", "A", "A"}
+	for cycle := 0; cycle < 2; cycle++ {
+		got := make([]string, len(want))
+		for i := range got {
+			var err error
+			got[i], err = d.Get(WeightedRoundRobinSelect)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("weighted sequence: %v, want %v", got, want)
+		}
+	}
+	if err := d.UpdateWeighted([]Server{{"A", 1}, {"B", 2}}); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 3)
+	for i := range got {
+		got[i], _ = d.Get(WeightedRoundRobinSelect)
+	}
+	if !reflect.DeepEqual(got, []string{"B", "A", "B"}) {
+		t.Fatalf("updated weights: %v", got)
+	}
+}
+
+func TestWeightedRetryExcludesFailedNode(t *testing.T) {
+	d := NewMultiServerDiscovery(nil)
+	if err := d.UpdateWeighted([]Server{{"A", 9}, {"B", 3}, {"C", 1}}); err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for i := 0; i < 4; i++ {
+		address, err := d.GetExcluding(WeightedRoundRobinSelect, "A")
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[address]++
+	}
+	if counts["A"] != 0 || counts["B"] != 3 || counts["C"] != 1 {
+		t.Fatalf("retry distribution: %v", counts)
+	}
+	if err := d.UpdateWeighted([]Server{{"A", 0}}); err == nil {
+		t.Fatal("zero weight accepted")
+	}
+}
+
+func TestRegistryWeightedRefresh(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Joeyrpc-Servers", "A,B,C")
+		w.Header().Set("X-Joeyrpc-Weights", "5,1,1")
+	}))
+	defer ts.Close()
+	d := NewRegistryDiscovery(ts.URL, time.Minute)
+	want := []string{"A", "A", "B", "A", "C", "A", "A"}
+	for _, expected := range want {
+		got, err := d.Get(WeightedRoundRobinSelect)
+		if err != nil || got != expected {
+			t.Fatalf("selected %q, want %q: %v", got, expected, err)
+		}
+	}
+}
 
 func TestStaticSelection(t *testing.T) {
 	d := NewMultiServerDiscovery([]string{"tcp@one", "tcp@two"})

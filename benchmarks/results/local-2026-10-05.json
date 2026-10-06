@@ -1,0 +1,174 @@
+{
+  "date": "2026-10-05",
+  "command": "go run ./benchmarks -requests 3000 -concurrency 16 -payload 65536 -warmup 100 -reuse-samples 200 -failover-samples 50 -inflight 20",
+  "runs": [
+    {
+      "go_version": "go1.26.4",
+      "os": "windows",
+      "architecture": "amd64",
+      "logical_cpus": 16,
+      "transport": "single process, TCP loopback, Gob",
+      "payload_bytes": 65536,
+      "concurrency": 16,
+      "warmup_calls": 100,
+      "shared_connection_throughput": {
+        "samples": 3000,
+        "elapsed_ms": 418.592,
+        "qps": 7166.888,
+        "p50_ms": 2.151,
+        "p95_ms": 2.917
+      },
+      "connection_reuse": {
+        "fresh_dial_call_close": {
+          "samples": 200,
+          "elapsed_ms": 203.703,
+          "qps": 981.82,
+          "p50_ms": 0.83,
+          "p95_ms": 1.324
+        },
+        "fresh_tcp_connections": 200,
+        "reused_call_only": {
+          "samples": 200,
+          "elapsed_ms": 58.764,
+          "qps": 3403.45,
+          "p50_ms": 0.253,
+          "p95_ms": 0.525
+        },
+        "reused_tcp_connections": 1
+      },
+      "offline_node_retry": {
+        "without_retry_failed": 50,
+        "retried_success": 50,
+        "retried_failed": 0,
+        "attempts_limit": 2,
+        "initial_backoff": "10ms with equal jitter",
+        "retry_call_timing": {
+          "samples": 50,
+          "elapsed_ms": 446.686,
+          "qps": 111.936,
+          "p50_ms": 8.971,
+          "p95_ms": 11.091
+        }
+      },
+      "graceful_shutdown": {
+        "in_flight_at_shutdown": 20,
+        "completed": 20,
+        "client_success": 20,
+        "hold_before_release_ms": 100,
+        "shutdown_ms": 101.525
+      }
+    },
+    {
+      "go_version": "go1.26.4",
+      "os": "windows",
+      "architecture": "amd64",
+      "logical_cpus": 16,
+      "transport": "single process, TCP loopback, Gob",
+      "payload_bytes": 65536,
+      "concurrency": 16,
+      "warmup_calls": 100,
+      "shared_connection_throughput": {
+        "samples": 3000,
+        "elapsed_ms": 426.878,
+        "qps": 7027.762,
+        "p50_ms": 2.172,
+        "p95_ms": 2.998
+      },
+      "connection_reuse": {
+        "fresh_dial_call_close": {
+          "samples": 200,
+          "elapsed_ms": 197.34,
+          "qps": 1013.48,
+          "p50_ms": 0.816,
+          "p95_ms": 1.355
+        },
+        "fresh_tcp_connections": 200,
+        "reused_call_only": {
+          "samples": 200,
+          "elapsed_ms": 62.174,
+          "qps": 3216.784,
+          "p50_ms": 0.28,
+          "p95_ms": 0.54
+        },
+        "reused_tcp_connections": 1
+      },
+      "offline_node_retry": {
+        "without_retry_failed": 50,
+        "retried_success": 50,
+        "retried_failed": 0,
+        "attempts_limit": 2,
+        "initial_backoff": "10ms with equal jitter",
+        "retry_call_timing": {
+          "samples": 50,
+          "elapsed_ms": 423.135,
+          "qps": 118.166,
+          "p50_ms": 8.215,
+          "p95_ms": 11.292
+        }
+      },
+      "graceful_shutdown": {
+        "in_flight_at_shutdown": 20,
+        "completed": 20,
+        "client_success": 20,
+        "hold_before_release_ms": 100,
+        "shutdown_ms": 101.483
+      }
+    },
+    {
+      "go_version": "go1.26.4",
+      "os": "windows",
+      "architecture": "amd64",
+      "logical_cpus": 16,
+      "transport": "single process, TCP loopback, Gob",
+      "payload_bytes": 65536,
+      "concurrency": 16,
+      "warmup_calls": 100,
+      "shared_connection_throughput": {
+        "samples": 3000,
+        "elapsed_ms": 467.317,
+        "qps": 6419.629,
+        "p50_ms": 2.341,
+        "p95_ms": 3.342
+      },
+      "connection_reuse": {
+        "fresh_dial_call_close": {
+          "samples": 200,
+          "elapsed_ms": 288.02,
+          "qps": 694.397,
+          "p50_ms": 0.965,
+          "p95_ms": 1.708
+        },
+        "fresh_tcp_connections": 200,
+        "reused_call_only": {
+          "samples": 200,
+          "elapsed_ms": 72.448,
+          "qps": 2760.601,
+          "p50_ms": 0.312,
+          "p95_ms": 0.673
+        },
+        "reused_tcp_connections": 1
+      },
+      "offline_node_retry": {
+        "without_retry_failed": 50,
+        "retried_success": 50,
+        "retried_failed": 0,
+        "attempts_limit": 2,
+        "initial_backoff": "10ms with equal jitter",
+        "retry_call_timing": {
+          "samples": 50,
+          "elapsed_ms": 467.331,
+          "qps": 106.991,
+          "p50_ms": 9.571,
+          "p95_ms": 11.205
+        }
+      },
+      "graceful_shutdown": {
+        "in_flight_at_shutdown": 20,
+        "completed": 20,
+        "client_success": 20,
+        "hold_before_release_ms": 100,
+        "shutdown_ms": 100.914
+      }
+    }
+  ]
+}

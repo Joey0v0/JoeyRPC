@@ -4,6 +4,7 @@ package registry
 import (
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +17,9 @@ const (
 
 // ServerItem records one endpoint and its most recent renewal.
 type ServerItem struct {
-	Addr  string
-	start time.Time
+	Addr   string
+	Weight int
+	start  time.Time
 }
 type Registry struct {
 	mu      sync.Mutex
@@ -32,7 +34,11 @@ func New(timeout time.Duration) *Registry {
 var DefaultRegistry = New(defaultTimeout)
 
 func (r *Registry) putServer(address string) {
-	renewed := &ServerItem{Addr: address, start: time.Now()}
+	r.putServerWeighted(address, 1)
+}
+
+func (r *Registry) putServerWeighted(address string, weight int) {
+	renewed := &ServerItem{Addr: address, Weight: weight, start: time.Now()}
 	r.mu.Lock()
 	if r.servers == nil {
 		r.servers = make(map[string]*ServerItem)
@@ -41,26 +47,34 @@ func (r *Registry) putServer(address string) {
 	r.mu.Unlock()
 }
 
-func (r *Registry) aliveServers() []string {
+func (r *Registry) aliveServers() []ServerItem {
 	now := time.Now()
 	r.mu.Lock()
-	addresses := make([]string, 0, len(r.servers))
+	servers := make([]ServerItem, 0, len(r.servers))
 	for address, lease := range r.servers {
 		expired := r.timeout != 0 && !lease.start.Add(r.timeout).After(now)
 		if expired {
 			delete(r.servers, address)
 		} else {
-			addresses = append(addresses, address)
+			servers = append(servers, *lease)
 		}
 	}
 	r.mu.Unlock()
-	sort.Strings(addresses)
-	return addresses
+	sort.Slice(servers, func(i, j int) bool { return servers[i].Addr < servers[j].Addr })
+	return servers
 }
 
 func (r *Registry) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodGet {
-		w.Header().Set("X-Joeyrpc-Servers", strings.Join(r.aliveServers(), ","))
+		servers := r.aliveServers()
+		addresses := make([]string, len(servers))
+		weights := make([]string, len(servers))
+		for i, server := range servers {
+			addresses[i] = server.Addr
+			weights[i] = strconv.Itoa(server.Weight)
+		}
+		w.Header().Set("X-Joeyrpc-Servers", strings.Join(addresses, ","))
+		w.Header().Set("X-Joeyrpc-Weights", strings.Join(weights, ","))
 		return
 	}
 	if request.Method != http.MethodPost {
@@ -72,7 +86,16 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	r.putServer(address)
+	weight := 1
+	if raw := request.Header.Get("X-Joeyrpc-Weight"); raw != "" {
+		var err error
+		weight, err = strconv.Atoi(raw)
+		if err != nil || weight < 1 || weight > 10000 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+	r.putServerWeighted(address, weight)
 }
 
 func (r *Registry) HandleHTTP(path string) { http.Handle(path, r) }

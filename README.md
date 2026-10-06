@@ -154,6 +154,8 @@ err = xc.Call(ctx, "Calculator.Sum", Args{A: 10, B: 20}, &reply)
 
 `XClient` 选择节点并管理底层连接；随机策略使用 `discovery.RandomSelect`。使用注册中心时，将静态发现替换为 `discovery.NewRegistryDiscovery(registryURL, 0)`。
 
+需要按实例能力分配请求时，服务端调用 `registry.HeartbeatWithWeight(registryURL, endpoint, 5, 0)` 上报权重，客户端将选择模式改为 `discovery.WeightedRoundRobinSelect`。例如两个实例权重为 5 和 1，长期调用次数会接近 5:1，并通过平滑加权轮询交错分配；未配置权重的实例默认为 1。静态地址也可用 `d.UpdateWeighted([]discovery.Server{{Addr: "tcp@127.0.0.1:8000", Weight: 5}, {Addr: "tcp@127.0.0.1:8001", Weight: 1}})` 配置。权重只影响请求选址，`Broadcast` 仍对每个实例调用一次。
+
 默认没有拦截器，重试默认关闭。完整配置见[扩展功能说明](docs/features.md)。
 
 ## 验证
@@ -164,6 +166,8 @@ go vet ./...
 ```
 
 测试覆盖并发调用、错误处理、Metadata、拦截器、重试和关闭。测试范围及平台说明见[测试说明](docs/testing.md)。
+
+本机 TCP 回环条件下的吞吐、延迟、连接复用和故障验证见[基准结果与复现方法](docs/benchmark.md)。
 
 ## 实现边界
 

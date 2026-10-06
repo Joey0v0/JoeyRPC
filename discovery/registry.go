@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,8 +33,26 @@ func NewRegistryDiscovery(address string, timeout time.Duration) *RegistryDiscov
 
 func (d *RegistryDiscovery) Update(servers []string) error {
 	snapshot := append([]string(nil), servers...)
+	weights := make([]int64, len(snapshot))
+	for i := range weights {
+		weights[i] = 1
+	}
 	d.mu.Lock()
-	d.servers = snapshot
+	d.setWeighted(snapshot, weights)
+	d.lastUpdate = time.Now()
+	d.revision++
+	d.mu.Unlock()
+	return nil
+}
+
+// UpdateWeighted manually replaces the cached registry snapshot.
+func (d *RegistryDiscovery) UpdateWeighted(servers []Server) error {
+	addresses, weights, err := checkedServers(servers)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.setWeighted(addresses, weights)
 	d.lastUpdate = time.Now()
 	d.revision++
 	d.mu.Unlock()
@@ -79,9 +98,26 @@ func (d *RegistryDiscovery) RefreshContext(ctx context.Context) error {
 			addresses = append(addresses, address)
 		}
 	}
+	weights := make([]int64, len(addresses))
+	for i := range weights {
+		weights[i] = 1
+	}
+	if raw := response.Header.Get("X-Joeyrpc-Weights"); raw != "" {
+		parts := strings.Split(raw, ",")
+		if len(parts) != len(addresses) {
+			return fmt.Errorf("rpc registry: weight count does not match server count")
+		}
+		for i, part := range parts {
+			weight, err := strconv.Atoi(strings.TrimSpace(part))
+			if err != nil || weight < 1 || weight > 10000 {
+				return fmt.Errorf("rpc registry: invalid weight for server %d", i)
+			}
+			weights[i] = int64(weight)
+		}
+	}
 	d.mu.Lock()
 	if d.revision == revision {
-		d.servers = addresses
+		d.setWeighted(addresses, weights)
 		d.lastUpdate = time.Now()
 		d.revision++
 	}
@@ -98,6 +134,13 @@ func (d *RegistryDiscovery) GetContext(ctx context.Context, mode SelectMode) (st
 		return "", err
 	}
 	return d.MultiServersDiscovery.Get(mode)
+}
+
+func (d *RegistryDiscovery) GetExcludingContext(ctx context.Context, mode SelectMode, excluded string) (string, error) {
+	if err := d.RefreshContext(ctx); err != nil {
+		return "", err
+	}
+	return d.MultiServersDiscovery.GetExcluding(mode, excluded)
 }
 func (d *RegistryDiscovery) GetAll() ([]string, error) {
 	return d.GetAllContext(context.Background())

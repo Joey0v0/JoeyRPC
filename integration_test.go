@@ -174,3 +174,49 @@ func TestRegistryDiscoveryRoundRobinAndBroadcast(t *testing.T) {
 		t.Fatalf("broadcast error was not propagated: %v", err)
 	}
 }
+
+func TestRegistryDiscoveryWeightedRoundRobin(t *testing.T) {
+	services := []*Arithmetic{{}, {}, {}}
+	ts := httptest.NewServer(registry.New(time.Minute))
+	defer ts.Close()
+	for i, service := range services {
+		address, stop := startRPC(t, service)
+		defer stop()
+		req, err := http.NewRequest(http.MethodPost, ts.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Joeyrpc-Server", address)
+		if i == 0 {
+			req.Header.Set("X-Joeyrpc-Weight", "5")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("registration failed: %s", resp.Status)
+		}
+	}
+	d := discovery.NewRegistryDiscovery(ts.URL, time.Minute)
+	xc := xclient.NewXClient(d, discovery.WeightedRoundRobinSelect, nil)
+	defer xc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := 0; i < 7; i++ {
+		var reply int
+		if err := xc.Call(ctx, "Arithmetic.Sum", SumArgs{10, i}, &reply); err != nil || reply != 10+i {
+			t.Fatalf("weighted call: reply=%d error=%v", reply, err)
+		}
+	}
+	for i, service := range services {
+		want := int32(1)
+		if i == 0 {
+			want = 5
+		}
+		if got := atomic.LoadInt32(&service.calls); got != want {
+			t.Fatalf("instance %d received %d calls, want %d", i, got, want)
+		}
+	}
+}

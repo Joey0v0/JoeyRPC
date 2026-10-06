@@ -68,3 +68,34 @@ func TestHeartbeatRejectsFailedRegistration(t *testing.T) {
 		t.Fatal("invalid registry URL was accepted")
 	}
 }
+
+func TestWeightedHeartbeatAndDiscoveryHeaders(t *testing.T) {
+	r := New(time.Minute)
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+	if err := sendHeartbeatWithWeight(ts.URL, "tcp@B", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendHeartbeatWithWeight(ts.URL, "tcp@A", 5); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Joeyrpc-Servers"); got != "tcp@A,tcp@B" {
+		t.Fatalf("addresses: %q", got)
+	}
+	if got := resp.Header.Get("X-Joeyrpc-Weights"); got != "5,1" {
+		t.Fatalf("weights: %q", got)
+	}
+	bad := httptest.NewRequest(http.MethodPost, "/", nil)
+	bad.Header.Set("X-Joeyrpc-Server", "tcp@A")
+	bad.Header.Set("X-Joeyrpc-Weight", "0")
+	recorder := httptest.NewRecorder()
+	r.ServeHTTP(recorder, bad)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid weight status: %d", recorder.Code)
+	}
+}

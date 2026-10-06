@@ -123,6 +123,31 @@ func TestRetryConnectionFailureSelectsAnotherNode(t *testing.T) {
 	}
 }
 
+func TestWeightedRetrySkipsFailedNode(t *testing.T) {
+	good, service, stop := retryEndpoint(t, false)
+	defer stop()
+	d := discovery.NewMultiServerDiscovery(nil)
+	if err := d.UpdateWeighted([]discovery.Server{
+		{Addr: unavailableEndpoint(t), Weight: 5},
+		{Addr: good, Weight: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	x := NewXClientWithOptions(d, discovery.WeightedRoundRobinSelect, nil, Options{
+		Retry: RetryOptions{MaxAttempts: 2, InitialBackoff: time.Millisecond},
+	})
+	defer x.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var reply int
+	if err := x.Call(ctx, "AttemptService.Sum", 41, &reply); err != nil || reply != 42 {
+		t.Fatalf("weighted failover: reply=%d error=%v", reply, err)
+	}
+	if got := atomic.LoadInt32(&service.calls); got != 1 {
+		t.Fatalf("successful node received %d calls", got)
+	}
+}
+
 func TestRetryNeverRepeatsBusinessError(t *testing.T) {
 	address, service, stop := retryEndpoint(t, false)
 	defer stop()

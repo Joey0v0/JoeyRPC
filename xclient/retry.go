@@ -58,6 +58,18 @@ func (x *XClient) selectAddress(ctx context.Context, previous string) (string, e
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if previous != "" {
+		if d, ok := x.d.(interface {
+			GetExcludingContext(context.Context, discovery.SelectMode, string) (string, error)
+		}); ok {
+			return d.GetExcludingContext(ctx, x.mode, previous)
+		}
+		if d, ok := x.d.(interface {
+			GetExcluding(discovery.SelectMode, string) (string, error)
+		}); ok {
+			return d.GetExcluding(x.mode, previous)
+		}
+	}
 	var address string
 	var err error
 	if d, ok := x.d.(interface {
